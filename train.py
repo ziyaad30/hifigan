@@ -169,6 +169,7 @@ def train_model(rank, world_size, args):
     logger.info("**" * 40 + "\n")
     
     pbar = tqdm
+    out_bar = tqdm
 
     for epoch in range(start_epoch, n_epochs + 1):
         train_sampler.set_epoch(epoch)
@@ -240,7 +241,7 @@ def train_model(rank, world_size, args):
                 generator.eval()
 
                 average_validation_loss = 0
-                for j, (wavs, mels, tgts) in enumerate(validation_loader, 1):
+                for j, (wavs, mels, tgts) in enumerate(out_bar(validation_loader), 1):
                     wavs, mels, tgts = wavs.to(rank), mels.to(rank), tgts.to(rank)
 
                     with torch.no_grad():
