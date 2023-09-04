@@ -20,14 +20,15 @@ from hifigan.discriminator import (
     generator_loss,
 )
 from hifigan.dataset import MelDataset, LogMelSpectrogram
-from hifigan.utils import load_checkpoint, save_checkpoint, plot_spectrogram
+from hifigan.utils import load_checkpoint, save_checkpoint, plot_spectrogram, latest_checkpoint_path
 
+from tqdm import tqdm
 
-logging.basicConfig(level=logging.DEBUG)
+logging.basicConfig(level=logging.WARNING)
 logger = logging.getLogger(__name__)
 
 
-BATCH_SIZE = 8
+BATCH_SIZE = 4
 SEGMENT_LENGTH = 8320
 HOP_LENGTH = 160
 SAMPLE_RATE = 16000
@@ -38,9 +39,9 @@ LEARNING_RATE_DECAY = 0.999
 WEIGHT_DECAY = 1e-5
 EPOCHS = 3100
 LOG_INTERVAL = 5
-VALIDATION_INTERVAL = 1000
-NUM_GENERATED_EXAMPLES = 10
-CHECKPOINT_INTERVAL = 5000
+VALIDATION_INTERVAL = 50
+NUM_GENERATED_EXAMPLES = 4
+CHECKPOINT_INTERVAL = 100
 
 
 def train_model(rank, world_size, args):
@@ -55,9 +56,9 @@ def train_model(rank, world_size, args):
     log_dir.mkdir(exist_ok=True, parents=True)
 
     if rank == 0:
-        logger.setLevel(logging.DEBUG)
+        logger.setLevel(logging.INFO)
         handler = logging.FileHandler(log_dir / f"{args.checkpoint_dir.stem}.log")
-        handler.setLevel(logging.DEBUG)
+        handler.setLevel(logging.WARNING)
         formatter = logging.Formatter(
             "%(asctime)s [%(levelname)s] %(message)s", datefmt="%m/%d/%Y %I:%M:%S"
         )
@@ -107,7 +108,7 @@ def train_model(rank, world_size, args):
         train_dataset,
         batch_size=BATCH_SIZE,
         sampler=train_sampler,
-        num_workers=8,
+        num_workers=2,
         pin_memory=True,
         shuffle=False,
         drop_last=True,
@@ -125,29 +126,36 @@ def train_model(rank, world_size, args):
         validation_dataset,
         batch_size=1,
         shuffle=False,
-        num_workers=8,
+        num_workers=0,
         pin_memory=True,
     )
 
     melspectrogram = LogMelSpectrogram().to(rank)
 
-    if args.resume is not None:
-        global_step, best_loss = load_checkpoint(
-            load_path=args.resume,
-            generator=generator,
-            discriminator=discriminator,
-            optimizer_generator=optimizer_generator,
-            optimizer_discriminator=optimizer_discriminator,
-            scheduler_generator=scheduler_generator,
-            scheduler_discriminator=scheduler_discriminator,
-            rank=rank,
-            logger=logger,
-            finetune=args.finetune,
-        )
+    if args.resume:
+        print('Trying to resume from saved checkpoint...')
+        try:
+            latest_model = latest_checkpoint_path(args.checkpoint_dir)
+            global_step, best_loss = load_checkpoint(
+                load_path=str(latest_model),
+                generator=generator,
+                discriminator=discriminator,
+                optimizer_generator=optimizer_generator,
+                optimizer_discriminator=optimizer_discriminator,
+                scheduler_generator=scheduler_generator,
+                scheduler_discriminator=scheduler_discriminator,
+                rank=rank,
+                logger=logger,
+                finetune=args.finetune,
+            )
+        except:
+            print("No saved checkpoints found...")
+            global_step, best_loss = 0, float("inf")
     else:
         global_step, best_loss = 0, float("inf")
 
     if args.finetune:
+        print('Finetuning selected...')
         global_step, best_loss = 0, float("inf")
 
     n_epochs = EPOCHS
@@ -159,6 +167,8 @@ def train_model(rank, world_size, args):
     logger.info(f"total of epochs: {n_epochs}")
     logger.info(f"started at epoch: {start_epoch}")
     logger.info("**" * 40 + "\n")
+    
+    pbar = tqdm
 
     for epoch in range(start_epoch, n_epochs + 1):
         train_sampler.set_epoch(epoch)
@@ -166,7 +176,7 @@ def train_model(rank, world_size, args):
         generator.train()
         discriminator.train()
         average_loss_mel = average_loss_discriminator = average_loss_generator = 0
-        for i, (wavs, mels, tgts) in enumerate(train_loader, 1):
+        for i, (wavs, mels, tgts) in enumerate(pbar(train_loader), 1):
             wavs, mels, tgts = wavs.to(rank), mels.to(rank), tgts.to(rank)
 
             # Discriminator
@@ -226,6 +236,7 @@ def train_model(rank, world_size, args):
                     )
 
             if global_step % VALIDATION_INTERVAL == 0:
+                pbar.write(f'Evaluating model at step {global_step}')
                 generator.eval()
 
                 average_validation_loss = 0
@@ -260,19 +271,20 @@ def train_model(rank, world_size, args):
 
                 generator.train()
                 discriminator.train()
-
+                pbar.write(f'Continuing training from step {global_step}')
+                
                 if rank == 0:
                     writer.add_scalar(
                         "validation/mel_loss", average_validation_loss, global_step
                     )
-                    logger.info(
+                    pbar.write(
                         f"valid -- epoch: {epoch}, mel loss: {average_validation_loss:.4f}"
                     )
 
                 new_best = best_loss > average_validation_loss
                 if new_best or global_step % CHECKPOINT_INTERVAL == 0:
                     if new_best:
-                        logger.info("-------- new best model found!")
+                        pbar.write("-------- new best model found!")
                         best_loss = average_validation_loss
 
                     if rank == 0:
@@ -293,7 +305,7 @@ def train_model(rank, world_size, args):
         scheduler_discriminator.step()
         scheduler_generator.step()
 
-        logger.info(
+        pbar.write(
             f"train -- epoch: {epoch}, mel loss: {average_loss_mel:.4f}, generator loss: {average_loss_generator:.4f}, discriminator loss: {average_loss_discriminator:.4f}"
         )
 
@@ -303,21 +315,21 @@ def train_model(rank, world_size, args):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Train or finetune HiFi-GAN.")
     parser.add_argument(
-        "dataset_dir",
-        metavar="dataset-dir",
+        "--dataset_dir",
+        default="dataset-resampled",
         help="path to the preprocessed data directory",
         type=Path,
     )
     parser.add_argument(
-        "checkpoint_dir",
-        metavar="checkpoint-dir",
+        "--checkpoint_dir",
+        default="checkpoints",
         help="path to the checkpoint directory",
         type=Path,
     )
     parser.add_argument(
         "--resume",
-        help="path to the checkpoint to resume from",
-        type=Path,
+        help="resume from checkpoint",
+        action="store_true",
     )
     parser.add_argument(
         "--finetune",
