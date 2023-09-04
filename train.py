@@ -28,7 +28,7 @@ logging.basicConfig(level=logging.WARNING)
 logger = logging.getLogger(__name__)
 
 
-BATCH_SIZE = 32
+BATCH_SIZE = 8
 SEGMENT_LENGTH = 8320
 HOP_LENGTH = 160
 SAMPLE_RATE = 16000
